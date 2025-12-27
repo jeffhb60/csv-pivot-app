@@ -12,7 +12,8 @@ from pivot_app import (DataSource,
                        q_ident, sql_str, normalize_duckdb_type,
                        ensure_con, relation_for_source, get_columns,
                        build_where,
-                       run_long_pivot, run_wide_pivot)
+                       run_long_pivot, run_wide_pivot,
+                       dataframe_to_csv_bytes, dataframe_to_xlsx_bytes)
 
 
 # ----------------------------
