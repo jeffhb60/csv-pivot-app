@@ -1,6 +1,67 @@
 import streamlit as st
 import pandas as pd
 import duckdb
+import re
+
+# ----------------------------
+# Helper functions
+# ----------------------------
+
+SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def q_ident(name: str) -> str:
+    """Quote an identifier safely for DuckDB SQL."""
+    if SAFE_IDENT_RE.match(name):
+        return name
+    return '"' + name.replace('"', '""') + '"'
+
+
+def sql_str(s: str) -> str:
+    """Safely quote a string value for SQL."""
+    return "'" + s.replace("'", "''") + "'"
+
+
+def run_long_pivot(con, table_name, row_dims, measure, agg_func):
+    """Run a long (grouped) pivot."""
+    dims_sql = ", ".join(q_ident(d) for d in row_dims)
+    if agg_func == "COUNT":
+        sql = f"SELECT {dims_sql}, COUNT(*) as value FROM {table_name} GROUP BY {dims_sql}"
+    else:
+        sql = f"SELECT {dims_sql}, {agg_func}({q_ident(measure)}) as value FROM {table_name} GROUP BY {dims_sql}"
+    return con.execute(sql).df()
+
+
+def run_wide_pivot(con, table_name, row_dims, col_dim, measure, agg_func, max_cols=50):
+    """Run a wide pivot."""
+    # Check distinct count
+    distinct_count = con.execute(f"SELECT COUNT(DISTINCT {q_ident(col_dim)}) FROM {table_name}").fetchone()[0]
+    if distinct_count > max_cols:
+        raise ValueError(f"Column dimension has {distinct_count} distinct values. Wide pivot is limited to {max_cols}.")
+
+    # Get distinct values
+    distinct_vals = con.execute(f"SELECT DISTINCT {q_ident(col_dim)} FROM {table_name} ORDER BY 1").df()[
+        col_dim].tolist()
+
+    # Build CASE statements
+    case_statements = []
+    for val in distinct_vals:
+        if agg_func == "COUNT":
+            case = f"SUM(CASE WHEN {q_ident(col_dim)} = {sql_str(val)} THEN 1 ELSE 0 END) AS {q_ident(str(val))}"
+        else:
+            case = f"{agg_func}(CASE WHEN {q_ident(col_dim)} = {sql_str(val)} THEN {q_ident(measure)} END) AS {q_ident(str(val))}"
+        case_statements.append(case)
+
+    dims_sql = ", ".join(q_ident(d) for d in row_dims)
+    select_list = f"{dims_sql}, " + ", ".join(case_statements)
+
+    sql = f"SELECT {select_list} FROM {table_name} GROUP BY {dims_sql}"
+    return con.execute(sql).df()
+
+
+# ----------------------------
+# Streamlit UI
+# ----------------------------
 
 st.set_page_config(page_title="CSV Pivot App", layout="wide")
 st.title("CSV Pivot App")
@@ -44,41 +105,14 @@ if uploaded_file is not None:
             if not row_dims:
                 st.error("Please select at least one row dimension.")
             else:
-                if pivot_mode == "Long":
-                    # Long pivot
-                    dims_sql = ", ".join(row_dims)
-                    if agg_func == "COUNT":
-                        sql = f"SELECT {dims_sql}, COUNT(*) as value FROM data GROUP BY {dims_sql}"
+                try:
+                    if pivot_mode == "Long":
+                        result = run_long_pivot(con, "data", row_dims, measure, agg_func)
                     else:
-                        sql = f"SELECT {dims_sql}, {agg_func}({measure}) as value FROM data GROUP BY {dims_sql}"
-                else:
-                    # Wide pivot
-                    # First, check distinct count of column dimension
-                    distinct_count = con.execute(f"SELECT COUNT(DISTINCT {col_dim}) FROM data").fetchone()[0]
-                    if distinct_count > 50:
-                        st.error(f"Column dimension has {distinct_count} distinct values. Wide pivot is limited to 50.")
-                        st.stop()
-
-                    # Get distinct values
-                    distinct_vals = con.execute(f"SELECT DISTINCT {col_dim} FROM data ORDER BY 1").df()[
-                        col_dim].tolist()
-
-                    # Build CASE statements
-                    case_statements = []
-                    for val in distinct_vals:
-                        if agg_func == "COUNT":
-                            case = f"SUM(CASE WHEN {col_dim} = '{val}' THEN 1 ELSE 0 END) AS \"{val}\""
-                        else:
-                            case = f"{agg_func}(CASE WHEN {col_dim} = '{val}' THEN {measure} END) AS \"{val}\""
-                        case_statements.append(case)
-
-                    dims_sql = ", ".join(row_dims)
-                    select_list = f"{dims_sql}, " + ", ".join(case_statements)
-
-                    sql = f"SELECT {select_list} FROM data GROUP BY {dims_sql}"
-
-                result = con.execute(sql).df()
-                st.dataframe(result)
+                        result = run_wide_pivot(con, "data", row_dims, col_dim, measure, agg_func, max_cols=50)
+                    st.dataframe(result)
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
     with st.expander("Preview Data"):
         st.dataframe(df.head(20))
