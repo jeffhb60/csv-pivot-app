@@ -1,2 +1,19 @@
 # CSV-Pivot-App
-An application where one can upload a CSV file and then covert it to a pivot table.  This will be useful in situations where the CSV file is too large for Excel.  
+***
+A local GUI Application for pivoting and aggregating CSV files using DuckDB.  
+
+## 1. Installation
+***
+
+```bash
+pip install -r requirements.txt
+```
+
+## 2. Usage
+***
+
+```bash
+streamlit run app.py
+```
+
+
