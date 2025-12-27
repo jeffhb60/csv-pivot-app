@@ -4,7 +4,7 @@ import duckdb
 import re
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List, Dict
 
 
 # ----------------------------
@@ -49,7 +49,6 @@ def ensure_con() -> duckdb.DuckDBPyConnection:
 def relation_for_source(src: DataSource) -> str:
     """Return a DuckDB relation expression for the data source."""
     if src.kind == "path":
-        # DuckDB is happier with forward slashes on Windows
         path = src.path.replace("\\", "/")
         return f"read_csv_auto({sql_str(path)})"
     elif src.kind == "upload":
@@ -68,29 +67,55 @@ def get_columns(con: duckdb.DuckDBPyConnection, src: DataSource):
     return con.execute(f"DESCRIBE SELECT * FROM {rel}").df()
 
 
-def run_long_pivot(con, src, row_dims, measure, agg_func):
+def build_where(filters: Dict[str, Dict[str, str]]) -> str:
+    """Build WHERE clause from filters."""
+    clauses = []
+    for col, spec in filters.items():
+        op = spec.get("op", "=")
+        val = spec.get("value", "")
+        c = q_ident(col)
+
+        if op == "is_null":
+            clauses.append(f"{c} IS NULL")
+        elif op == "not_null":
+            clauses.append(f"{c} IS NOT NULL")
+        elif op == "contains":
+            clauses.append(f"{c} ILIKE '%' || {sql_str(val)} || '%'")
+        elif op == "startswith":
+            clauses.append(f"{c} ILIKE {sql_str(val + '%')}")
+        elif op == "endswith":
+            clauses.append(f"{c} ILIKE {sql_str('%' + val)}")
+        else:
+            clauses.append(f"{c} {op} {sql_str(val)}")
+    return " AND ".join(clauses) if clauses else ""
+
+
+def run_long_pivot(con, src, row_dims, measure, agg_func, where_sql=""):
     """Run a long (grouped) pivot."""
     rel = relation_for_source(src)
     dims_sql = ", ".join(q_ident(d) for d in row_dims)
+    where_clause = f"WHERE {where_sql}" if where_sql else ""
+
     if agg_func == "COUNT":
-        sql = f"SELECT {dims_sql}, COUNT(*) as value FROM {rel} GROUP BY {dims_sql}"
+        sql = f"SELECT {dims_sql}, COUNT(*) as value FROM {rel} {where_clause} GROUP BY {dims_sql}"
     else:
-        sql = f"SELECT {dims_sql}, {agg_func}({q_ident(measure)}) as value FROM {rel} GROUP BY {dims_sql}"
+        sql = f"SELECT {dims_sql}, {agg_func}({q_ident(measure)}) as value FROM {rel} {where_clause} GROUP BY {dims_sql}"
     return con.execute(sql).df()
 
 
-def run_wide_pivot(con, src, row_dims, col_dim, measure, agg_func, max_cols=50):
+def run_wide_pivot(con, src, row_dims, col_dim, measure, agg_func, where_sql="", max_cols=50):
     """Run a wide pivot."""
     rel = relation_for_source(src)
+    where_clause = f"WHERE {where_sql}" if where_sql else ""
 
-    # Check distinct count
-    distinct_count = con.execute(f"SELECT COUNT(DISTINCT {q_ident(col_dim)}) FROM {rel}").fetchone()[0]
+    # Check distinct count (with filter)
+    distinct_count = con.execute(f"SELECT COUNT(DISTINCT {q_ident(col_dim)}) FROM {rel} {where_clause}").fetchone()[0]
     if distinct_count > max_cols:
         raise ValueError(f"Column dimension has {distinct_count} distinct values. Wide pivot is limited to {max_cols}.")
 
-    # Get distinct values
+    # Get distinct values (with filter)
     distinct_vals = con.execute(
-        f"SELECT DISTINCT {q_ident(col_dim)} AS v FROM {rel} ORDER BY 1"
+        f"SELECT DISTINCT {q_ident(col_dim)} AS v FROM {rel} {where_clause} ORDER BY 1"
     ).df()["v"].tolist()
 
     # Build CASE statements
@@ -105,7 +130,7 @@ def run_wide_pivot(con, src, row_dims, col_dim, measure, agg_func, max_cols=50):
     dims_sql = ", ".join(q_ident(d) for d in row_dims)
     select_list = f"{dims_sql}, " + ", ".join(case_statements)
 
-    sql = f"SELECT {select_list} FROM {rel} GROUP BY {dims_sql}"
+    sql = f"SELECT {select_list} FROM {rel} {where_clause} GROUP BY {dims_sql}"
     return con.execute(sql).df()
 
 
@@ -115,6 +140,10 @@ def run_wide_pivot(con, src, row_dims, col_dim, measure, agg_func, max_cols=50):
 
 st.set_page_config(page_title="CSV Pivot App", layout="wide")
 st.title("CSV Pivot App")
+
+# Initialize session state for filters
+if "filters" not in st.session_state:
+    st.session_state.filters = {}
 
 # Sidebar for data source selection
 with st.sidebar:
@@ -138,13 +167,19 @@ if src is not None:
     columns_df = get_columns(con, src)
     all_columns = columns_df['column_name'].tolist()
 
-    col1, col2 = st.columns(2)
+    # Main tabs
+    tab1, tab2, tab3 = st.tabs(["Data", "Pivot", "Filters"])
 
-    with col1:
+    with tab1:
         st.write("Columns:")
         st.dataframe(columns_df)
 
-    with col2:
+        with st.expander("Preview Data"):
+            rel = relation_for_source(src)
+            preview_df = con.execute(f"SELECT * FROM {rel} LIMIT 20").df()
+            st.dataframe(preview_df)
+
+    with tab2:
         st.subheader("Pivot Configuration")
 
         pivot_mode = st.radio("Pivot Mode", ["Long", "Wide"], horizontal=True)
@@ -163,18 +198,38 @@ if src is not None:
                 st.error("Please select at least one row dimension.")
             else:
                 try:
+                    where_sql = build_where(st.session_state.filters)
                     if pivot_mode == "Long":
-                        result = run_long_pivot(con, src, row_dims, measure, agg_func)
+                        result = run_long_pivot(con, src, row_dims, measure, agg_func, where_sql)
                     else:
-                        result = run_wide_pivot(con, src, row_dims, col_dim, measure, agg_func, max_cols=50)
+                        result = run_wide_pivot(con, src, row_dims, col_dim, measure, agg_func, where_sql, max_cols=50)
                     st.dataframe(result)
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-    # Preview data
-    with st.expander("Preview Data"):
-        rel = relation_for_source(src)
-        preview_df = con.execute(f"SELECT * FROM {rel} LIMIT 20").df()
-        st.dataframe(preview_df)
+    with tab3:
+        st.subheader("Filters")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            filter_column = st.selectbox("Column", [""] + all_columns, key="filter_col")
+        with col2:
+            filter_op = st.selectbox("Operator",
+                                     ["=", "!=", ">", ">=", "<", "<=", "contains", "startswith", "endswith", "is_null",
+                                      "not_null"], key="filter_op")
+        with col3:
+            filter_value = st.text_input("Value", key="filter_val")
+
+        if st.button("Add Filter"):
+            if filter_column:
+                st.session_state.filters[filter_column] = {"op": filter_op, "value": filter_value}
+
+        if st.session_state.filters:
+            st.write("Active Filters:")
+            for col, spec in st.session_state.filters.items():
+                st.write(f"- {col} {spec['op']} {spec.get('value', '')}")
+
+            if st.button("Clear All Filters"):
+                st.session_state.filters = {}
 else:
     st.info("Please load a CSV file using the sidebar.")
