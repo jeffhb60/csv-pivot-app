@@ -8,18 +8,19 @@ import tempfile
 import hashlib
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
+from pivot_app import DataSource, q_ident, sql_str, normalize_duckdb_type
 
 
 # ----------------------------
 # Data structures
 # ----------------------------
 
-@dataclass
-class DataSource:
-    kind: str  # "path" or "upload"
-    path: Optional[str] = None
-    uploaded_bytes: Optional[bytes] = None
-    name: Optional[str] = None
+# @dataclass
+# class DataSource:
+#     kind: str  # "path" or "upload"
+#     path: Optional[str] = None
+#     uploaded_bytes: Optional[bytes] = None
+#     name: Optional[str] = None
 
 
 # ----------------------------
@@ -42,16 +43,16 @@ TIMESTAMP_TYPES = {"TIMESTAMP", "TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP_NS", "
 BOOL_TYPES = {"BOOLEAN"}
 
 
-def q_ident(name: str) -> str:
-    """Quote an identifier safely for DuckDB SQL."""
-    if SAFE_IDENT_RE.match(name):
-        return name
-    return '"' + name.replace('"', '""') + '"'
-
-
-def sql_str(s: str) -> str:
-    """Safely quote a string value for SQL."""
-    return "'" + str(s).replace("'", "''") + "'"
+# def q_ident(name: str) -> str:
+#     """Quote an identifier safely for DuckDB SQL."""
+#     if SAFE_IDENT_RE.match(name):
+#         return name
+#     return '"' + name.replace('"', '""') + '"'
+#
+#
+# def sql_str(s: str) -> str:
+#     """Safely quote a string value for SQL."""
+#     return "'" + str(s).replace("'", "''") + "'"
 
 
 def ensure_con() -> duckdb.DuckDBPyConnection:
@@ -109,15 +110,15 @@ def get_columns(con: duckdb.DuckDBPyConnection, src: DataSource) -> pd.DataFrame
     return con.execute(f"DESCRIBE SELECT * FROM {rel}").df()
 
 
-def normalize_duckdb_type(t: str) -> str:
-    """
-    Normalize column_type strings from DESCRIBE into a basic type token.
-    Example: 'DECIMAL(18,2)' -> 'DECIMAL'
-    """
-    t = (t or "").upper().strip()
-    if "(" in t:
-        t = t.split("(", 1)[0].strip()
-    return t
+# def normalize_duckdb_type(t: str) -> str:
+#     """
+#     Normalize column_type strings from DESCRIBE into a basic type token.
+#     Example: 'DECIMAL(18,2)' -> 'DECIMAL'
+#     """
+#     t = (t or "").upper().strip()
+#     if "(" in t:
+#         t = t.split("(", 1)[0].strip()
+#     return t
 
 
 def build_where(filters: List[Dict[str, Any]], col_types: Dict[str, str]) -> str:
