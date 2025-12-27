@@ -11,7 +11,8 @@ from typing import Optional, Dict, Any, List, Tuple
 from pivot_app import (DataSource,
                        q_ident, sql_str, normalize_duckdb_type,
                        ensure_con, relation_for_source, get_columns,
-                       build_where)
+                       build_where,
+                       run_long_pivot, run_wide_pivot)
 
 
 # ----------------------------
@@ -193,121 +194,121 @@ BOOL_TYPES = {"BOOLEAN"}
 #     return " AND ".join(clauses)
 
 
-def _safe_wide_colname(val: Any, used: set) -> str:
-    """
-    Make a stable, Excel-friendly, SQL-safe column alias for wide pivots.
-    Also avoids collisions by appending a short hash.
-    """
-    s = str(val)
-    base = SAFE_COLNAME_RE.sub("_", s).strip("_")
-    if not base:
-        base = "col"
-    base = base[:40]  # keep it reasonable
-    h = hashlib.md5(s.encode("utf-8")).hexdigest()[:6]
-    name = f"{base}_{h}"
-    # ensure uniqueness even if base+hash collides (rare, but let's be adults)
-    i = 2
-    while name in used:
-        name = f"{base}_{h}_{i}"
-        i += 1
-    used.add(name)
-    return name
-
-
-def run_long_pivot(
-    con: duckdb.DuckDBPyConnection,
-    src: DataSource,
-    row_dims: List[str],
-    measure: str,
-    agg_func: str,
-    where_sql: str = "",
-    limit: int = 2000,
-) -> pd.DataFrame:
-    """Run a long (grouped) pivot (deterministic preview)."""
-    rel = relation_for_source(src)
-    dims_sql = ", ".join(q_ident(d) for d in row_dims)
-    where_clause = f"WHERE {where_sql}" if where_sql else ""
-
-    if agg_func == "COUNT":
-        sql = f"""
-        SELECT {dims_sql}, COUNT(*) AS value
-        FROM {rel}
-        {where_clause}
-        GROUP BY {dims_sql}
-        ORDER BY value DESC
-        LIMIT {int(limit)}
-        """
-    else:
-        sql = f"""
-        SELECT {dims_sql}, {agg_func}({q_ident(measure)}) AS value
-        FROM {rel}
-        {where_clause}
-        GROUP BY {dims_sql}
-        ORDER BY value DESC
-        LIMIT {int(limit)}
-        """
-    return con.execute(sql).df()
-
-
-def run_wide_pivot(
-    con: duckdb.DuckDBPyConnection,
-    src: DataSource,
-    row_dims: List[str],
-    col_dim: str,
-    measure: str,
-    agg_func: str,
-    where_sql: str = "",
-    max_cols: int = 200,
-    limit: int = 2000,
-) -> pd.DataFrame:
-    """Run a wide pivot (with safer column names + deterministic preview)."""
-    rel = relation_for_source(src)
-    where_clause = f"WHERE {where_sql}" if where_sql else ""
-
-    distinct_count = con.execute(
-        f"SELECT COUNT(DISTINCT {q_ident(col_dim)}) FROM {rel} {where_clause}"
-    ).fetchone()[0]
-    if distinct_count > max_cols:
-        raise ValueError(
-            f"Column dimension has {distinct_count} distinct values. "
-            f"Wide pivot is limited to {max_cols}."
-        )
-
-    distinct_vals = con.execute(
-        f"SELECT DISTINCT {q_ident(col_dim)} AS v FROM {rel} {where_clause} ORDER BY 1"
-    ).df()["v"].tolist()
-
-    used_aliases = set()
-    case_statements = []
-    for val in distinct_vals:
-        alias = _safe_wide_colname(val, used_aliases)
-        if agg_func == "COUNT":
-            case = (
-                f"SUM(CASE WHEN {q_ident(col_dim)} = {sql_str(val)} THEN 1 ELSE 0 END) "
-                f"AS {q_ident(alias)}"
-            )
-        else:
-            case = (
-                f"{agg_func}(CASE WHEN {q_ident(col_dim)} = {sql_str(val)} "
-                f"THEN {q_ident(measure)} END) AS {q_ident(alias)}"
-            )
-        case_statements.append(case)
-
-    dims_sql = ", ".join(q_ident(d) for d in row_dims)
-    select_list = f"{dims_sql}, " + ", ".join(case_statements)
-
-    # Deterministic ordering by row dimensions (best-effort for preview)
-    order_sql = dims_sql if dims_sql else "1"
-
-    sql = f"""
-    SELECT {select_list}
-    FROM {rel}
-    {where_clause}
-    GROUP BY {dims_sql}
-    ORDER BY {order_sql}
-    LIMIT {int(limit)}
-    """
-    return con.execute(sql).df()
+# def _safe_wide_colname(val: Any, used: set) -> str:
+#     """
+#     Make a stable, Excel-friendly, SQL-safe column alias for wide pivots.
+#     Also avoids collisions by appending a short hash.
+#     """
+#     s = str(val)
+#     base = SAFE_COLNAME_RE.sub("_", s).strip("_")
+#     if not base:
+#         base = "col"
+#     base = base[:40]  # keep it reasonable
+#     h = hashlib.md5(s.encode("utf-8")).hexdigest()[:6]
+#     name = f"{base}_{h}"
+#     # ensure uniqueness even if base+hash collides (rare, but let's be adults)
+#     i = 2
+#     while name in used:
+#         name = f"{base}_{h}_{i}"
+#         i += 1
+#     used.add(name)
+#     return name
+#
+#
+# def run_long_pivot(
+#     con: duckdb.DuckDBPyConnection,
+#     src: DataSource,
+#     row_dims: List[str],
+#     measure: str,
+#     agg_func: str,
+#     where_sql: str = "",
+#     limit: int = 2000,
+# ) -> pd.DataFrame:
+#     """Run a long (grouped) pivot (deterministic preview)."""
+#     rel = relation_for_source(src)
+#     dims_sql = ", ".join(q_ident(d) for d in row_dims)
+#     where_clause = f"WHERE {where_sql}" if where_sql else ""
+#
+#     if agg_func == "COUNT":
+#         sql = f"""
+#         SELECT {dims_sql}, COUNT(*) AS value
+#         FROM {rel}
+#         {where_clause}
+#         GROUP BY {dims_sql}
+#         ORDER BY value DESC
+#         LIMIT {int(limit)}
+#         """
+#     else:
+#         sql = f"""
+#         SELECT {dims_sql}, {agg_func}({q_ident(measure)}) AS value
+#         FROM {rel}
+#         {where_clause}
+#         GROUP BY {dims_sql}
+#         ORDER BY value DESC
+#         LIMIT {int(limit)}
+#         """
+#     return con.execute(sql).df()
+#
+#
+# def run_wide_pivot(
+#     con: duckdb.DuckDBPyConnection,
+#     src: DataSource,
+#     row_dims: List[str],
+#     col_dim: str,
+#     measure: str,
+#     agg_func: str,
+#     where_sql: str = "",
+#     max_cols: int = 200,
+#     limit: int = 2000,
+# ) -> pd.DataFrame:
+#     """Run a wide pivot (with safer column names + deterministic preview)."""
+#     rel = relation_for_source(src)
+#     where_clause = f"WHERE {where_sql}" if where_sql else ""
+#
+#     distinct_count = con.execute(
+#         f"SELECT COUNT(DISTINCT {q_ident(col_dim)}) FROM {rel} {where_clause}"
+#     ).fetchone()[0]
+#     if distinct_count > max_cols:
+#         raise ValueError(
+#             f"Column dimension has {distinct_count} distinct values. "
+#             f"Wide pivot is limited to {max_cols}."
+#         )
+#
+#     distinct_vals = con.execute(
+#         f"SELECT DISTINCT {q_ident(col_dim)} AS v FROM {rel} {where_clause} ORDER BY 1"
+#     ).df()["v"].tolist()
+#
+#     used_aliases = set()
+#     case_statements = []
+#     for val in distinct_vals:
+#         alias = _safe_wide_colname(val, used_aliases)
+#         if agg_func == "COUNT":
+#             case = (
+#                 f"SUM(CASE WHEN {q_ident(col_dim)} = {sql_str(val)} THEN 1 ELSE 0 END) "
+#                 f"AS {q_ident(alias)}"
+#             )
+#         else:
+#             case = (
+#                 f"{agg_func}(CASE WHEN {q_ident(col_dim)} = {sql_str(val)} "
+#                 f"THEN {q_ident(measure)} END) AS {q_ident(alias)}"
+#             )
+#         case_statements.append(case)
+#
+#     dims_sql = ", ".join(q_ident(d) for d in row_dims)
+#     select_list = f"{dims_sql}, " + ", ".join(case_statements)
+#
+#     # Deterministic ordering by row dimensions (best-effort for preview)
+#     order_sql = dims_sql if dims_sql else "1"
+#
+#     sql = f"""
+#     SELECT {select_list}
+#     FROM {rel}
+#     {where_clause}
+#     GROUP BY {dims_sql}
+#     ORDER BY {order_sql}
+#     LIMIT {int(limit)}
+#     """
+#     return con.execute(sql).df()
 
 
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
