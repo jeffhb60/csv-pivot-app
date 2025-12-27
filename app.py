@@ -3,6 +3,8 @@ import pandas as pd
 import duckdb
 import re
 import os
+import io
+import tempfile
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 
@@ -42,6 +44,7 @@ def ensure_con() -> duckdb.DuckDBPyConnection:
     """Ensure DuckDB connection exists in session state."""
     if "duckdb_con" not in st.session_state:
         con = duckdb.connect(database=":memory:")
+        con.execute("PRAGMA threads=4;")
         st.session_state["duckdb_con"] = con
     return st.session_state["duckdb_con"]
 
@@ -90,7 +93,7 @@ def build_where(filters: Dict[str, Dict[str, str]]) -> str:
     return " AND ".join(clauses) if clauses else ""
 
 
-def run_long_pivot(con, src, row_dims, measure, agg_func, where_sql=""):
+def run_long_pivot(con, src, row_dims, measure, agg_func, where_sql="", limit=2000):
     """Run a long (grouped) pivot."""
     rel = relation_for_source(src)
     dims_sql = ", ".join(q_ident(d) for d in row_dims)
@@ -100,10 +103,13 @@ def run_long_pivot(con, src, row_dims, measure, agg_func, where_sql=""):
         sql = f"SELECT {dims_sql}, COUNT(*) as value FROM {rel} {where_clause} GROUP BY {dims_sql}"
     else:
         sql = f"SELECT {dims_sql}, {agg_func}({q_ident(measure)}) as value FROM {rel} {where_clause} GROUP BY {dims_sql}"
+
+    # Add limit for preview
+    sql += f" LIMIT {limit}"
     return con.execute(sql).df()
 
 
-def run_wide_pivot(con, src, row_dims, col_dim, measure, agg_func, where_sql="", max_cols=50):
+def run_wide_pivot(con, src, row_dims, col_dim, measure, agg_func, where_sql="", max_cols=200, limit=2000):
     """Run a wide pivot."""
     rel = relation_for_source(src)
     where_clause = f"WHERE {where_sql}" if where_sql else ""
@@ -131,7 +137,27 @@ def run_wide_pivot(con, src, row_dims, col_dim, measure, agg_func, where_sql="",
     select_list = f"{dims_sql}, " + ", ".join(case_statements)
 
     sql = f"SELECT {select_list} FROM {rel} {where_clause} GROUP BY {dims_sql}"
+
+    # Add limit for preview
+    sql += f" LIMIT {limit}"
     return con.execute(sql).df()
+
+
+def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Convert DataFrame to CSV bytes."""
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def dataframe_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
+    """Convert DataFrame to Excel bytes."""
+    if df.shape[0] > 1_048_576 or df.shape[1] > 16_384:
+        raise ValueError("Result too large for Excel limits. Export as CSV instead.")
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="pivot")
+    buf.seek(0)
+    return buf.read()
 
 
 # ----------------------------
@@ -160,6 +186,11 @@ with st.sidebar:
         if file_path and os.path.exists(file_path):
             src = DataSource(kind="path", path=file_path)
 
+    st.divider()
+    st.header("Settings")
+    preview_limit = st.number_input("Preview Row Limit", min_value=50, max_value=10000, value=2000, step=50)
+    max_pivot_cols = st.number_input("Max Wide Pivot Columns", min_value=10, max_value=1000, value=200, step=10)
+
 if src is not None:
     con = ensure_con()
 
@@ -168,7 +199,7 @@ if src is not None:
     all_columns = columns_df['column_name'].tolist()
 
     # Main tabs
-    tab1, tab2, tab3 = st.tabs(["Data", "Pivot", "Filters"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Data", "Pivot", "Filters", "Export"])
 
     with tab1:
         st.write("Columns:")
@@ -193,16 +224,21 @@ if src is not None:
         else:
             col_dim = None
 
-        if st.button("Run Pivot"):
+        if st.button("Run Pivot", type="primary"):
             if not row_dims:
                 st.error("Please select at least one row dimension.")
             else:
                 try:
                     where_sql = build_where(st.session_state.filters)
                     if pivot_mode == "Long":
-                        result = run_long_pivot(con, src, row_dims, measure, agg_func, where_sql)
+                        result = run_long_pivot(con, src, row_dims, measure, agg_func, where_sql, limit=preview_limit)
                     else:
-                        result = run_wide_pivot(con, src, row_dims, col_dim, measure, agg_func, where_sql, max_cols=50)
+                        result = run_wide_pivot(con, src, row_dims, col_dim, measure, agg_func, where_sql,
+                                                max_cols=max_pivot_cols, limit=preview_limit)
+
+                    st.session_state["last_result"] = result
+                    st.session_state["last_pivot_mode"] = pivot_mode
+
                     st.dataframe(result)
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -231,5 +267,36 @@ if src is not None:
 
             if st.button("Clear All Filters"):
                 st.session_state.filters = {}
+
+    with tab4:
+        st.subheader("Export")
+
+        if "last_result" in st.session_state:
+            df = st.session_state["last_result"]
+
+            st.write(f"Result shape: {df.shape[0]} rows, {df.shape[1]} columns")
+
+            # CSV Export
+            csv_bytes = dataframe_to_csv_bytes(df)
+            st.download_button(
+                label="Download as CSV",
+                data=csv_bytes,
+                file_name="pivot_result.csv",
+                mime="text/csv"
+            )
+
+            # Excel Export
+            try:
+                xlsx_bytes = dataframe_to_xlsx_bytes(df)
+                st.download_button(
+                    label="Download as Excel",
+                    data=xlsx_bytes,
+                    file_name="pivot_result.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            except ValueError as e:
+                st.warning(f"Cannot export to Excel: {e}")
+        else:
+            st.info("Run a pivot first to export results.")
 else:
     st.info("Please load a CSV file using the sidebar.")
